@@ -1,5 +1,7 @@
 import Foundation
 
+// Modified by Moonshot to add a validated, portable enrollment-state snapshot.
+
 // MARK: - Configuration
 
 /// Configuration for Sortformer streaming diarization.
@@ -324,6 +326,50 @@ public struct SortformerStreamingState: Sendable {
         self.meanSilenceEmbedding.removeAll(keepingCapacity: false)
         self.silenceFrameCount = 0
     }
+}
+
+/// Persistable enrollment state. This contains biometric-derived embeddings and must be
+/// protected with the same care as the source enrollment audio.
+public struct SortformerEnrollmentSnapshot: Codable, Sendable, Equatable {
+    public static let currentSchemaVersion = 1
+
+    public struct Configuration: Codable, Sendable, Equatable {
+        public let chunkLen: Int
+        public let chunkLeftContext: Int
+        public let chunkRightContext: Int
+        public let fifoLen: Int
+        public let spkcacheLen: Int
+        public let spkcacheUpdatePeriod: Int
+        public let spkcacheSilFramesPerSpk: Int
+        public let numSpeakers: Int
+        public let preEncoderDims: Int
+    }
+
+    public struct Speaker: Codable, Sendable, Equatable {
+        public let slot: Int
+        public let name: String
+    }
+
+    public let schemaVersion: Int
+    public let bankDigest: String
+    public let configuration: Configuration
+    public let spkcache: [Float]
+    public let spkcacheLength: Int
+    public let spkcachePreds: [Float]?
+    public let fifo: [Float]
+    public let fifoLength: Int
+    public let fifoPreds: [Float]?
+    public let meanSilenceEmbedding: [Float]
+    public let silenceFrameCount: Int
+    public let speakers: [Speaker]
+}
+
+public enum SortformerEnrollmentSnapshotError: Error, Equatable {
+    case notInitialized
+    case unsupportedSchema
+    case bankDigestMismatch
+    case incompatibleConfiguration
+    case malformedState
 }
 
 // MARK: - Streaming Feature Provider

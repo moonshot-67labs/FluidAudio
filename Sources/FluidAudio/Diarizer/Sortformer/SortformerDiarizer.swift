@@ -3,6 +3,8 @@ import CoreML
 import Foundation
 import OSLog
 
+// Modified by Moonshot to add validated enrollment-state snapshot and restore.
+
 /// Streaming speaker diarization using NVIDIA's Sortformer model.
 ///
 /// Sortformer provides end-to-end streaming diarization with 4 fixed speaker slots,
@@ -194,6 +196,114 @@ public final class SortformerDiarizer: Diarizer {
         _timeline.reset(keepingSpeakers: keepingSpeakers)
 
         featureBuffer.reserveCapacity((config.chunkMelFrames + config.coreFrames) * config.melFeatures)
+    }
+
+    /// Exports the enrollment cache and its aligned named speaker slots.
+    /// The caller-provided digest must identify the complete ordered enrollment bank.
+    public func makeEnrollmentSnapshot(bankDigest: String) throws -> SortformerEnrollmentSnapshot {
+        try withLock {
+            guard _models != nil else { throw SortformerEnrollmentSnapshotError.notInitialized }
+            let speakers = _timeline.speakers.compactMap { slot, speaker -> SortformerEnrollmentSnapshot.Speaker? in
+                guard let name = speaker.name, !name.isEmpty else { return nil }
+                return .init(slot: slot, name: name)
+            }.sorted { $0.slot < $1.slot }
+            let snapshot = SortformerEnrollmentSnapshot(
+                schemaVersion: SortformerEnrollmentSnapshot.currentSchemaVersion,
+                bankDigest: bankDigest,
+                configuration: enrollmentSnapshotConfiguration,
+                spkcache: _state.spkcache,
+                spkcacheLength: _state.spkcacheLength,
+                spkcachePreds: _state.spkcachePreds,
+                fifo: _state.fifo,
+                fifoLength: _state.fifoLength,
+                fifoPreds: _state.fifoPreds,
+                meanSilenceEmbedding: _state.meanSilenceEmbedding,
+                silenceFrameCount: _state.silenceFrameCount,
+                speakers: speakers
+            )
+            try validateEnrollmentSnapshot(snapshot, expectedBankDigest: bankDigest)
+            return snapshot
+        }
+    }
+
+    /// Restores enrollment before live audio starts. All live stream and timeline counters are reset.
+    public func restoreEnrollmentSnapshot(
+        _ snapshot: SortformerEnrollmentSnapshot,
+        expectedBankDigest: String
+    ) throws {
+        try withLock {
+            guard _models != nil else { throw SortformerEnrollmentSnapshotError.notInitialized }
+            try validateEnrollmentSnapshot(snapshot, expectedBankDigest: expectedBankDigest)
+            _state.spkcache = snapshot.spkcache
+            _state.spkcacheLength = snapshot.spkcacheLength
+            _state.spkcachePreds = snapshot.spkcachePreds
+            _state.fifo = snapshot.fifo
+            _state.fifoLength = snapshot.fifoLength
+            _state.fifoPreds = snapshot.fifoPreds
+            _state.meanSilenceEmbedding = snapshot.meanSilenceEmbedding
+            _state.silenceFrameCount = snapshot.silenceFrameCount
+            _timeline.reset()
+            for speaker in snapshot.speakers {
+                _timeline.upsertSpeaker(named: speaker.name, atIndex: speaker.slot)
+            }
+            resetBuffersLocked(keepingSpeakers: true)
+        }
+    }
+
+    private var enrollmentSnapshotConfiguration: SortformerEnrollmentSnapshot.Configuration {
+        .init(
+            chunkLen: config.chunkLen,
+            chunkLeftContext: config.chunkLeftContext,
+            chunkRightContext: config.chunkRightContext,
+            fifoLen: config.fifoLen,
+            spkcacheLen: config.spkcacheLen,
+            spkcacheUpdatePeriod: config.spkcacheUpdatePeriod,
+            spkcacheSilFramesPerSpk: config.spkcacheSilFramesPerSpk,
+            numSpeakers: config.numSpeakers,
+            preEncoderDims: config.preEncoderDims
+        )
+    }
+
+    private func validateEnrollmentSnapshot(
+        _ snapshot: SortformerEnrollmentSnapshot,
+        expectedBankDigest: String
+    ) throws {
+        guard snapshot.schemaVersion == SortformerEnrollmentSnapshot.currentSchemaVersion else {
+            throw SortformerEnrollmentSnapshotError.unsupportedSchema
+        }
+        guard !expectedBankDigest.isEmpty, snapshot.bankDigest == expectedBankDigest else {
+            throw SortformerEnrollmentSnapshotError.bankDigestMismatch
+        }
+        guard snapshot.configuration == enrollmentSnapshotConfiguration else {
+            throw SortformerEnrollmentSnapshotError.incompatibleConfiguration
+        }
+        let dims = config.preEncoderDims
+        let speakers = config.numSpeakers
+        let maxCacheLength = config.spkcacheLen + config.spkcacheUpdatePeriod
+        let maxFIFOLength = config.fifoLen + config.chunkLen
+        let uniqueSlots = Set(snapshot.speakers.map(\.slot))
+        let namesAreValid = snapshot.speakers.allSatisfy {
+            $0.slot >= 0 && $0.slot < speakers && !$0.name.isEmpty
+        }
+        let arrays = [snapshot.spkcache, snapshot.fifo, snapshot.meanSilenceEmbedding]
+        let optionalArrays = [snapshot.spkcachePreds, snapshot.fifoPreds].compactMap { $0 }
+        guard snapshot.spkcacheLength >= 0,
+            snapshot.spkcacheLength <= maxCacheLength,
+            snapshot.fifoLength >= 0,
+            snapshot.fifoLength <= maxFIFOLength,
+            snapshot.spkcache.count == snapshot.spkcacheLength * dims,
+            snapshot.fifo.count == snapshot.fifoLength * dims,
+            snapshot.spkcachePreds?.count == snapshot.spkcacheLength * speakers,
+            snapshot.fifoPreds?.count == snapshot.fifoLength * speakers,
+            snapshot.meanSilenceEmbedding.count == dims,
+            snapshot.silenceFrameCount >= 0,
+            uniqueSlots.count == snapshot.speakers.count,
+            namesAreValid,
+            arrays.allSatisfy({ $0.allSatisfy(\.isFinite) }),
+            optionalArrays.allSatisfy({ $0.allSatisfy(\.isFinite) })
+        else {
+            throw SortformerEnrollmentSnapshotError.malformedState
+        }
     }
 
     /// Cleanup resources.
