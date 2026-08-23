@@ -3,7 +3,12 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches:
+      - main
+      # Moonshot maintenance branches: the app pins exact revisions on
+      # moonshot/*, so every push here must get the full build-and-test
+      # run the pinned revision will be trusted on.
+      - "moonshot/**"
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
