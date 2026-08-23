@@ -71,9 +71,17 @@ public final class SortformerDiarizer: Diarizer {
     // Native mel spectrogram (used when useNativePreprocessing is enabled)
     private let melSpectrogram = AudioMelSpectrogram()
 
-    // Audio buffering
+    // Audio buffering. `audioBuffer` always starts at sample
+    // `melFramesEmitted * melStride - nFFT/2` of the session's virtually
+    // center-padded stream; it is seeded with the nFFT/2-zero batch left pad
+    // at reset.
     private var audioBuffer: [Float] = []
     private var lastAudioSample: Float = 0
+    /// Frames of the session's mel stream emitted so far.
+    internal private(set) var melFramesEmitted: Int = 0
+    /// Set once `padAndEmitRemainingMelLocked` has flushed the final frames.
+    private var melInputExhausted: Bool = false
+    private var warnedDroppedAudio: Bool = false
 
     // Feature buffering
     internal var featureBuffer: [Float] = []
@@ -94,6 +102,7 @@ public final class SortformerDiarizer: Diarizer {
         self.stateUpdater = SortformerStateUpdater(config: config)
         self._state = SortformerStreamingState(config: config)
         self._timeline = DiarizerTimeline(config: timelineConfig)
+        resetMelStreamLocked()
     }
 
     /// Initialize with CoreML models (combined pipeline mode).
@@ -185,17 +194,41 @@ public final class SortformerDiarizer: Diarizer {
 
     /// Internal reset - caller must hold lock
     private func resetBuffersLocked(keepingSpeakers: Bool = false) {
-        audioBuffer = []
-        featureBuffer = []
-        lastAudioSample = 0
-        startFeat = 0
+        resetMelStreamLocked()
         diarizerChunkIndex = 0
         _numFramesProcessed = 0
-        _realSamplesReceived = 0
         _finalized = false
         _timeline.reset(keepingSpeakers: keepingSpeakers)
 
         featureBuffer.reserveCapacity((config.chunkMelFrames + config.coreFrames) * config.melFeatures)
+    }
+
+    /// Reset the incremental mel stream: an empty feature buffer and an audio
+    /// buffer seeded with the batch left pad (nFFT/2 zeros) - caller must
+    /// hold lock.
+    private func resetMelStreamLocked() {
+        featureBuffer.removeAll(keepingCapacity: true)
+        startFeat = 0
+        lastAudioSample = 0
+        melFramesEmitted = 0
+        melInputExhausted = false
+        warnedDroppedAudio = false
+        _realSamplesReceived = 0
+        audioBuffer.removeAll(keepingCapacity: true)
+        audioBuffer.append(contentsOf: [Float](repeating: 0, count: melSpectrogram.nFFT / 2))
+    }
+
+    /// True (after a one-time warning) when the mel stream is exhausted and
+    /// incoming audio must be dropped; buffering it would grow without bound
+    /// since nothing consumes audio after `finalizeSession` - caller must
+    /// hold lock.
+    private func shouldDropAudioLocked() -> Bool {
+        guard melInputExhausted else { return false }
+        if !warnedDroppedAudio {
+            warnedDroppedAudio = true
+            logger.warning("Audio added after finalizeSession is ignored; call reset() to start a new session")
+        }
+        return true
     }
 
     /// Exports the enrollment cache and its aligned named speaker slots.
@@ -397,16 +430,25 @@ public final class SortformerDiarizer: Diarizer {
             _timeline.reset(keepingSpeakers: true)
             var occupiedIndices = Set(_timeline.speakers.keys)
 
+            // Every exit (guard failures and thrown errors included) must
+            // clear the enrollment clip's mel stream: padAndEmitRemainingMel
+            // sets the exhausted latch, which would otherwise silently
+            // disable all further streaming until reset().
+            defer {
+                resetMelStreamLocked()
+                diarizerChunkIndex = 0
+                _numFramesProcessed = 0
+            }
+
             // Clear audio and feature buffers to avoid enrolling this speaker with stale audio.
-            startFeat = 0
-            lastAudioSample = 0
+            resetMelStreamLocked()
             diarizerChunkIndex = 0
-            audioBuffer.removeAll(keepingCapacity: true)
-            featureBuffer.removeAll(keepingCapacity: true)
-            _realSamplesReceived = 0
+            _realSamplesReceived = normalized.count
             audioBuffer.append(contentsOf: normalized)
 
-            preprocessAudioToFeaturesLocked()
+            // The enrollment clip is a complete utterance: emit its full
+            // mel stream, right pad included.
+            padAndEmitRemainingMelLocked()
 
             // Accumulate per-slot speech frames from the diarizer updates rather than
             // from persisted timeline segments, so enrollment works even when the
@@ -446,13 +488,6 @@ public final class SortformerDiarizer: Diarizer {
                                 + "at index \(bestSlot) and overwritingAssignedSpeakerName=false"
                         )
                         _timeline.reset(keepingSpeakersWhere: { occupiedIndices.contains($0.index) })
-                        _numFramesProcessed = 0
-                        diarizerChunkIndex = 0
-                        startFeat = 0
-                        lastAudioSample = 0
-                        audioBuffer.removeAll(keepingCapacity: true)
-                        featureBuffer.removeAll(keepingCapacity: true)
-                        _realSamplesReceived = 0
                         return nil
                     }
                     logger.warning(
@@ -471,13 +506,6 @@ public final class SortformerDiarizer: Diarizer {
             }
 
             _timeline.reset(keepingSpeakersWhere: { occupiedIndices.contains($0.index) })
-            _numFramesProcessed = 0
-            diarizerChunkIndex = 0
-            startFeat = 0
-            lastAudioSample = 0
-            audioBuffer.removeAll(keepingCapacity: true)
-            featureBuffer.removeAll(keepingCapacity: true)
-            _realSamplesReceived = 0
 
             logger.info(
                 "Enrolled speaker \(description) with \(normalized.count) samples "
@@ -498,6 +526,7 @@ public final class SortformerDiarizer: Diarizer {
     ///   - sourceSampleRate: Source audio sample rate
     public func addAudio(_ samples: [Float]) {
         lock.withLock {
+            guard !shouldDropAudioLocked() else { return }
             audioBuffer.append(contentsOf: samples)
             _realSamplesReceived += samples.count
             preprocessAudioToFeaturesLocked()
@@ -515,6 +544,7 @@ public final class SortformerDiarizer: Diarizer {
     ) throws {
         let normalized = try normalizeSamples(samples, sourceSampleRate: sourceSampleRate)
         lock.withLock {
+            guard !shouldDropAudioLocked() else { return }
             audioBuffer.append(contentsOf: normalized)
             _realSamplesReceived += normalized.count
             preprocessAudioToFeaturesLocked()
@@ -531,6 +561,7 @@ public final class SortformerDiarizer: Diarizer {
         sourceSampleRate: Double? = nil
     ) throws where C.Element == Float {
         try lock.withLock {
+            guard !shouldDropAudioLocked() else { return }
             if let sourceSampleRate, sourceSampleRate != Double(config.sampleRate) {
                 let normalized = try normalizeSamples(Array(samples), sourceSampleRate: sourceSampleRate)
                 audioBuffer.append(contentsOf: normalized)
@@ -565,6 +596,7 @@ public final class SortformerDiarizer: Diarizer {
     ) throws -> DiarizerTimelineUpdate?
     where C.Element == Float {
         return try lock.withLock {
+            guard !shouldDropAudioLocked() else { return nil }
             if let sourceSampleRate, sourceSampleRate != Double(config.sampleRate) {
                 let normalized = try normalizeSamples(Array(samples), sourceSampleRate: sourceSampleRate)
                 audioBuffer.append(contentsOf: normalized)
@@ -675,20 +707,17 @@ public final class SortformerDiarizer: Diarizer {
             }
             guard !_finalized else { return nil }
 
-            // Drain every remaining full-rc chunk. preprocessAudioToFeaturesLocked
-            // only emits one chunk's worth of mel features per call, so loop:
-            // preprocess audio → drain feature chunks → repeat until the audio
-            // buffer can't yield another full chunk.
+            // Emit the trailing mel frames (whose windows overlap the batch
+            // right pad), then drain every remaining full-rc chunk.
             var aggFinalized: [Float] = []
             var aggTentative: [Float] = []
             var didDrain = false
-            preprocessAudioToFeaturesLocked()
+            padAndEmitRemainingMelLocked()
             while let chunk = try makeStreamingChunkLocked() {
                 aggFinalized.append(contentsOf: chunk.finalizedPredictions)
                 aggTentative = chunk.tentativePredictions
                 _numFramesProcessed += chunk.finalizedFrameCount
                 didDrain = true
-                preprocessAudioToFeaturesLocked()
             }
 
             // Absorb trailing tentative as finalized — mirrors offline
@@ -822,7 +851,7 @@ public final class SortformerDiarizer: Diarizer {
             }
 
             // Reset for fresh processing
-            let keepSpeakers = keepSpeakers ?? (featureBuffer.isEmpty && audioBuffer.isEmpty && diarizerChunkIndex == 0)
+            let keepSpeakers = keepSpeakers ?? (_realSamplesReceived == 0 && diarizerChunkIndex == 0)
             if !keepSpeakers {
                 _state = SortformerStreamingState(config: config)
             }
@@ -911,50 +940,74 @@ public final class SortformerDiarizer: Diarizer {
 
     // MARK: - Helpers
 
-    /// Preprocess audio into mel features - caller must hold lock
+    /// Preprocess audio into mel features - caller must hold lock.
+    ///
+    /// Emits every frame of the session's batch-equivalent (center-padded)
+    /// mel stream whose window is already covered by received samples, so
+    /// frame count and values do not depend on how the audio was batched
+    /// into `addAudio` calls. Frame k spans samples
+    /// `[k * melStride - melWindow/2, k * melStride + melWindow/2)`; the
+    /// trailing frames whose windows overlap the batch right pad are emitted
+    /// by `padAndEmitRemainingMelLocked` at session end.
     private func preprocessAudioToFeaturesLocked() {
-        let targetFeatureFrames = startFeat + config.coreFrames + config.chunkRightContext * config.subsamplingFactor
-        preprocessAudioToFeatureTargetLocked(targetFeatureFrames: targetFeatureFrames)
+        guard !melInputExhausted else { return }
+        let halfWindow = config.melWindow / 2
+        guard _realSamplesReceived >= halfWindow else { return }
+        let computableFrames = (_realSamplesReceived - halfWindow) / config.melStride + 1
+        let count = computableFrames - melFramesEmitted
+        guard count > 0 else { return }
+        emitMelFramesLocked(count)
     }
 
-    private func preprocessAudioToFeatureTargetLocked(targetFeatureFrames: Int) {
-        guard !audioBuffer.isEmpty else { return }
-        if audioBuffer.count < config.melWindow { return }
-
-        let featLength = featureBuffer.count / config.melFeatures
-        let framesNeeded = targetFeatureFrames - featLength
-        guard framesNeeded > 0 else { return }
-
-        let samplesNeeded: Int
-        if featureBuffer.isEmpty {
-            samplesNeeded = (framesNeeded - 1) * config.melStride + config.melWindow
-        } else {
-            samplesNeeded = framesNeeded * config.melStride
-        }
-
-        guard audioBuffer.count >= samplesNeeded else { return }
-
+    /// Compute the next `count` frames of the mel stream from `audioBuffer`
+    /// and append them to `featureBuffer`, consuming `count * melStride`
+    /// samples - caller must hold lock and guarantee the buffer covers the
+    /// frames' windows.
+    private func emitMelFramesLocked(_ count: Int) {
         let (mel, melLength, _) = melSpectrogram.computeFlatTransposed(
             audio: audioBuffer,
-            lastAudioSample: lastAudioSample
+            lastAudioSample: lastAudioSample,
+            paddingMode: .prePadded,
+            expectedFrameCount: count
         )
-
-        guard melLength > 0 else { return }
-
+        assert(melLength == count && mel.count == count * config.melFeatures)
         featureBuffer.append(contentsOf: mel)
 
-        // Invert the center-padded frame count formula to compute samples consumed.
-        // This ensures samplesConsumed ≤ audioBuffer.count, preserving leftover samples
-        // and maintaining preemphasis continuity across streaming chunks.
-        let samplesConsumed = (melLength - 1) * config.melStride + config.melWindow - melSpectrogram.nFFT
+        let samplesConsumed = count * config.melStride
+        lastAudioSample = audioBuffer[samplesConsumed - 1]
+        audioBuffer.removeFirst(samplesConsumed)
+        melFramesEmitted += count
+    }
 
-        if samplesConsumed <= audioBuffer.count {
-            lastAudioSample = audioBuffer[samplesConsumed - 1]
-            audioBuffer.removeFirst(samplesConsumed)
-        } else {
-            lastAudioSample = 0
-            audioBuffer.removeAll()
+    /// Emit the remaining frames of the mel stream by appending the batch
+    /// right pad, reaching the exact frame count batch (`.center`) mode
+    /// produces for the complete session audio - caller must hold lock.
+    /// Idempotent; further audio is ignored once called.
+    private func padAndEmitRemainingMelLocked() {
+        guard !melInputExhausted else { return }
+        melInputExhausted = true
+        guard _realSamplesReceived > 0 else { return }
+
+        let totalFrames =
+            1 + (_realSamplesReceived + melSpectrogram.nFFT - config.melWindow) / config.melStride
+        let remaining = totalFrames - melFramesEmitted
+        guard remaining > 0 else { return }
+
+        // The pad is a preemphasis-cancelling decay rather than literal
+        // zeros: the in-place preemphasis filter turns it into the exact
+        // zeros of the batch right pad.
+        let padLength = melSpectrogram.nFFT / 2
+        var tail = [Float](repeating: 0, count: padLength)
+        if melSpectrogram.preemph != 0, let lastReal = audioBuffer.last {
+            var value = lastReal
+            for i in 0..<padLength {
+                value *= melSpectrogram.preemph
+                tail[i] = value
+            }
         }
+        audioBuffer.append(contentsOf: tail)
+
+        emitMelFramesLocked(remaining)
     }
 
     private func normalizeSamples(
@@ -976,6 +1029,14 @@ public final class SortformerDiarizer: Diarizer {
         lock.lock()
         defer { lock.unlock() }
         return getNextChunkFeaturesLocked()
+    }
+
+    /// Emit the trailing mel frames as `finalizeSession` would, without
+    /// requiring loaded models (for testing).
+    internal func padAndEmitRemainingMel() {
+        lock.lock()
+        defer { lock.unlock() }
+        padAndEmitRemainingMelLocked()
     }
 
     /// Get next chunk features - caller must hold lock
