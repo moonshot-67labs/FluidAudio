@@ -301,33 +301,67 @@ public final class SortformerDiarizer: Diarizer {
         _ snapshot: SortformerEnrollmentSnapshot,
         expectedBankDigest: String
     ) throws {
+        try Self.validateEnrollmentSnapshot(
+            snapshot,
+            against: enrollmentSnapshotConfiguration,
+            expectedBankDigest: expectedBankDigest
+        )
+    }
+
+    /// The complete admission rule for a persisted enrollment state, kept
+    /// free of models so it can be proven directly.
+    ///
+    /// Prediction arrays follow the reference streaming state
+    /// (`StreamingSortformerState` in NeMo's `sortformer_modules.py`, and
+    /// `SortformerStateUpdater.streamingUpdate` here): `fifoPreds` exists
+    /// from the first processed chunk, and `spkcachePreds` stays `nil`
+    /// until the speaker cache first overflows and is compressed. A bank
+    /// shorter than the cache therefore legitimately exports a non-empty
+    /// speaker cache with no predictions. The previous rule compared
+    /// `Int?` against `Int`, so every such state was `malformedState` and
+    /// no enrollment under roughly thirty seconds could ever persist.
+    static func validateEnrollmentSnapshot(
+        _ snapshot: SortformerEnrollmentSnapshot,
+        against configuration: SortformerEnrollmentSnapshot.Configuration,
+        expectedBankDigest: String
+    ) throws {
         guard snapshot.schemaVersion == SortformerEnrollmentSnapshot.currentSchemaVersion else {
             throw SortformerEnrollmentSnapshotError.unsupportedSchema
         }
         guard !expectedBankDigest.isEmpty, snapshot.bankDigest == expectedBankDigest else {
             throw SortformerEnrollmentSnapshotError.bankDigestMismatch
         }
-        guard snapshot.configuration == enrollmentSnapshotConfiguration else {
+        guard snapshot.configuration == configuration else {
             throw SortformerEnrollmentSnapshotError.incompatibleConfiguration
         }
-        let dims = config.preEncoderDims
-        let speakers = config.numSpeakers
-        let maxCacheLength = config.spkcacheLen + config.spkcacheUpdatePeriod
-        let maxFIFOLength = config.fifoLen + config.chunkLen
+        let dims = configuration.preEncoderDims
+        let speakers = configuration.numSpeakers
+        let maxCacheLength = configuration.spkcacheLen + configuration.spkcacheUpdatePeriod
+        let maxFIFOLength = configuration.fifoLen + configuration.chunkLen
         let uniqueSlots = Set(snapshot.speakers.map(\.slot))
         let namesAreValid = snapshot.speakers.allSatisfy {
             $0.slot >= 0 && $0.slot < speakers && !$0.name.isEmpty
         }
         let arrays = [snapshot.spkcache, snapshot.fifo, snapshot.meanSilenceEmbedding]
         let optionalArrays = [snapshot.spkcachePreds, snapshot.fifoPreds].compactMap { $0 }
+        // Present predictions must cover exactly the frames they describe.
+        // Absent predictions are legal only in the states the updater
+        // produces them in: a FIFO that has processed nothing, and a
+        // speaker cache that has never been compressed.
+        let spkcachePredsAreConsistent = snapshot.spkcachePreds.map {
+            $0.count == snapshot.spkcacheLength * speakers
+        } ?? (snapshot.spkcacheLength <= configuration.spkcacheLen)
+        let fifoPredsAreConsistent = snapshot.fifoPreds.map {
+            $0.count == snapshot.fifoLength * speakers
+        } ?? (snapshot.fifoLength == 0)
         guard snapshot.spkcacheLength >= 0,
             snapshot.spkcacheLength <= maxCacheLength,
             snapshot.fifoLength >= 0,
             snapshot.fifoLength <= maxFIFOLength,
             snapshot.spkcache.count == snapshot.spkcacheLength * dims,
             snapshot.fifo.count == snapshot.fifoLength * dims,
-            snapshot.spkcachePreds?.count == snapshot.spkcacheLength * speakers,
-            snapshot.fifoPreds?.count == snapshot.fifoLength * speakers,
+            spkcachePredsAreConsistent,
+            fifoPredsAreConsistent,
             snapshot.meanSilenceEmbedding.count == dims,
             snapshot.silenceFrameCount >= 0,
             uniqueSlots.count == snapshot.speakers.count,
@@ -337,6 +371,7 @@ public final class SortformerDiarizer: Diarizer {
         else {
             throw SortformerEnrollmentSnapshotError.malformedState
         }
+    }
     }
 
     /// Cleanup resources.
