@@ -348,12 +348,14 @@ public final class SortformerDiarizer: Diarizer {
         // Absent predictions are legal only in the states the updater
         // produces them in: a FIFO that has processed nothing, and a
         // speaker cache that has never been compressed.
-        let spkcachePredsAreConsistent = snapshot.spkcachePreds.map {
-            $0.count == snapshot.spkcacheLength * speakers
-        } ?? (snapshot.spkcacheLength <= configuration.spkcacheLen)
-        let fifoPredsAreConsistent = snapshot.fifoPreds.map {
-            $0.count == snapshot.fifoLength * speakers
-        } ?? (snapshot.fifoLength == 0)
+        let spkcachePredsAreConsistent =
+            snapshot.spkcachePreds.map {
+                $0.count == snapshot.spkcacheLength * speakers
+            } ?? (snapshot.spkcacheLength <= configuration.spkcacheLen)
+        let fifoPredsAreConsistent =
+            snapshot.fifoPreds.map {
+                $0.count == snapshot.fifoLength * speakers
+            } ?? (snapshot.fifoLength == 0)
         guard snapshot.spkcacheLength >= 0,
             snapshot.spkcacheLength <= maxCacheLength,
             snapshot.fifoLength >= 0,
@@ -371,7 +373,6 @@ public final class SortformerDiarizer: Diarizer {
         else {
             throw SortformerEnrollmentSnapshotError.malformedState
         }
-    }
     }
 
     /// Cleanup resources.
