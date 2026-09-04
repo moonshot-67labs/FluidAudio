@@ -372,7 +372,6 @@ public final class SortformerDiarizer: Diarizer {
             throw SortformerEnrollmentSnapshotError.malformedState
         }
     }
-    }
 
     /// Cleanup resources.
     public func cleanup() {
